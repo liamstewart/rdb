@@ -5,12 +5,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
 
-	"github.com/cupcake/rdb/crc64"
+	"github.com/liamstewart/rdb/crc64"
 )
 
 // A Decoder must be implemented to parse a RDB file.
@@ -101,20 +102,22 @@ type decode struct {
 type ValueType byte
 
 const (
-	TypeString ValueType = 0
-	TypeList   ValueType = 1
-	TypeSet    ValueType = 2
-	TypeZSet   ValueType = 3
-	TypeHash   ValueType = 4
-	TypeZSet2  ValueType = 5
-	TypeModule ValueType = 6
+	TypeString  ValueType = 0
+	TypeList    ValueType = 1
+	TypeSet     ValueType = 2
+	TypeZSet    ValueType = 3
+	TypeHash    ValueType = 4
+	TypeZSet2   ValueType = 5 // ZSET with doubles stored in binary
+	TypeModule  ValueType = 6
+	TypeModule2 ValueType = 7
 
-	TypeHashZipmap    ValueType = 9
-	TypeListZiplist   ValueType = 10
-	TypeSetIntset     ValueType = 11
-	TypeZSetZiplist   ValueType = 12
-	TypeHashZiplist   ValueType = 13
-	TypeListQuicklist ValueType = 14
+	TypeHashZipmap      ValueType = 9
+	TypeListZiplist     ValueType = 10
+	TypeSetIntset       ValueType = 11
+	TypeZSetZiplist     ValueType = 12
+	TypeHashZiplist     ValueType = 13
+	TypeListQuicklist   ValueType = 14
+	TypeStreamListPacks ValueType = 15
 )
 
 const (
@@ -124,12 +127,15 @@ const (
 	rdb64bitLen = 0x81
 	rdbEncVal   = 3
 
-	rdbFlagAux      = 0xfa
-	rdbFlagResizeDB = 0xfb
-	rdbFlagExpiryMS = 0xfc
-	rdbFlagExpiry   = 0xfd
-	rdbFlagSelectDB = 0xfe
-	rdbFlagEOF      = 0xff
+	rdbFlagModuleAux = 247
+	rdbFlagIdle      = 248
+	rdbFlagFreq      = 249
+	rdbFlagAux       = 250
+	rdbFlagResizeDB  = 251
+	rdbFlagExpiryMS  = 252
+	rdbFlagExpiry    = 253
+	rdbFlagSelectDB  = 254
+	rdbFlagEOF       = 255
 
 	rdbEncInt8  = 0
 	rdbEncInt16 = 1
@@ -165,6 +171,18 @@ func (d *decode) decode() error {
 			return err
 		}
 		switch objType {
+		case rdbFlagModuleAux:
+			return errors.New("rdb: unable to read redis modules")
+		case rdbFlagIdle:
+			_, _, err = d.readLength()
+			if err != nil {
+				return err
+			}
+		case rdbFlagFreq:
+			_, _, err := d.readLength()
+			if err != nil {
+				return err
+			}
 		case rdbFlagAux:
 			auxKey, err := d.readString()
 			if err != nil {
@@ -258,6 +276,8 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 			d.readZiplist(key, 0, false)
 		}
 		d.event.EndList(key)
+	case TypeStreamListPacks:
+		d.readStream(key, expiry)
 	case TypeSet:
 		cardinality, _, err := d.readLength()
 		if err != nil {
@@ -283,14 +303,14 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 			if err != nil {
 				return err
 			}
-			var score float64;
+			var score float64
 			if typ == TypeZSet2 {
-				score, err = d.readDouble64();
+				score, err = d.readDouble64()
 				if err != nil {
 					return err
 				}
 			} else {
-				score, err = d.readFloat64();
+				score, err = d.readFloat64()
 				if err != nil {
 					return err
 				}
@@ -328,10 +348,77 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 		return d.readZiplistHash(key, expiry)
 	case TypeModule:
 		return fmt.Errorf("rdb: unable to read Redis Modules RDB objects (key %s)", key)
+	case TypeModule2:
+		return fmt.Errorf("rdb: unable to read Redis Modules AUX RDB objects (key %s)", key)
 	default:
 		return fmt.Errorf("rdb: unknown object type %d for key %s", typ, key)
 	}
 	return nil
+}
+
+func (d *decode) readStream(key []byte, expiry int64) error {
+	listpacksCount, _, _ := d.readLength()
+	for i := uint32(0); i < listpacksCount; i++ {
+		d.readString() // entryId
+		d.readString() // data
+	}
+
+	d.readLength() // items
+	d.readStreamEntryID()
+
+	cgroupsCount, _, _ := d.readLength()
+	for i := uint32(0); i < cgroupsCount; i++ {
+		d.readString() // name
+		d.readStreamEntryID()
+		pendingCount, _, _ := d.readLength()
+		for j := uint32(0); j < pendingCount; j++ {
+			d.readEid()
+			d.readMSTime() // deliveryTime
+			d.readLength() // deliveryCount
+		}
+		consumerCount, _, _ := d.readLength()
+		for j := uint32(0); j < consumerCount; j++ {
+			d.readString() // name
+			d.readMSTime() // seenTime
+			pendingCount, _, _ := d.readLength()
+			for k := uint32(0); k < pendingCount; k++ {
+				d.readEid()
+			}
+		}
+	}
+	return nil
+}
+
+func (d *decode) readEid() ([]byte, error) {
+	eid := make([]byte, 16)
+	_, err := io.ReadFull(d.r, eid)
+	if err != nil {
+		return nil, err
+	}
+	return eid, nil
+}
+
+func (d *decode) readMSTime() (int64, error) {
+	timestamp := make([]byte, 8)
+	_, err := io.ReadFull(d.r, timestamp)
+	if err != nil {
+		return int64(-1), err
+	}
+	return int64(binary.LittleEndian.Uint64(timestamp)) * 1000, nil
+}
+
+func (d *decode) readStreamEntryID() (string, error) {
+	ts, _, err := d.readLength() //
+	if err != nil {
+		return "", err
+	}
+	db, _, err := d.readLength() //
+	if err != nil {
+		return "", err
+	}
+	tsString := strconv.FormatUint(uint64(ts), 10)
+	dbString := strconv.FormatUint(uint64(db), 10)
+	return fmt.Sprintf("%s-%s", tsString, dbString), nil
 }
 
 func (d *decode) readZipmap(key []byte, expiry int64) error {
@@ -641,7 +728,7 @@ func (d *decode) checkHeader() error {
 	}
 
 	version, _ := strconv.ParseInt(string(header[5:]), 10, 64)
-	if version < 1 || version > 8 {
+	if version < 1 || version > 9 {
 		return fmt.Errorf("rdb: invalid RDB version number %d", version)
 	}
 
@@ -741,8 +828,8 @@ func (d *decode) readDouble64() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	bits := binary.LittleEndian.Uint64(d.intBuf);
-	return float64(math.Float64frombits(bits)), nil;
+	bits := binary.LittleEndian.Uint64(d.intBuf)
+	return float64(math.Float64frombits(bits)), nil
 }
 
 // Doubles are saved as strings prefixed by an unsigned
@@ -811,7 +898,7 @@ func (d *decode) readLength() (uint32, bool, error) {
 			length, err := d.readUint32Big()
 			return length, false, err
 		}
-		
+
 	}
 
 	panic("not reached")
